@@ -603,27 +603,29 @@ constraint.packageName + "@" + constraint.versionConstraint  + ": no such versio
         failed = true;
         return;
       }
-    } else {
-      // Add the package to the list of packages that we use directly.
-      usingDirectly[constraint.packageName] = constraint.versionConstraint;
-      var usingIndirectly = project.getDepsAsObj(project.getIndirectDependencies(options.appDir));
-      console.log(usingDirectly);
+    }
+    // Add the package to the list of packages that we use directly.
+    console.log("F");
 
-      // Call the constraint solver.
-      var ConstraintSolver = unipackage.load({
+    usingDirectly[constraint.packageName] = constraint.versionConstraint;
+    var usingIndirectly = project.getDepsAsObj(project.getIndirectDependencies(options.appDir));
+    console.log(usingDirectly);
+
+    // Call the constraint solver.
+    var ConstraintSolver = unipackage.load({
       	library: release.current.library,
         packages: ['constraint-solver'],
         release: release.current.name
-      })['constraint-solver'].ConstraintSolver;
+    })['constraint-solver'].ConstraintSolver;
 
-      console.log("Going to init constraint resolver");
-      var resolver = new ConstraintSolver.Resolver(cat);
-      console.log("Initialized constraint resolver");
+    console.log("Going to init constraint resolver");
+    var resolver = new ConstraintSolver.Resolver(cat);
+    console.log("Initialized constraint resolver");
 
-      var newVersions = resolver.resolve(usingDirectly,
+    var newVersions = resolver.resolve(usingDirectly,
                                          usingIndirectly,
                                          { optionsGoHere : false });
-      _.forEach(newVersions, function(version, packageName) {
+    _.forEach(newVersions, function(version, packageName) {
         if (failed)
           return;
 
@@ -671,9 +673,7 @@ constraint.packageName + "@" + constraint.versionConstraint  + ": no such versio
       // Log that this happened! Yay!
       var note = versionInfo.description;
       process.stdout.write(constraint.packageName + ": " + note + "\n");
-    }
-  });
-
+   });
   return failed ? 1 : 0;
 });
 

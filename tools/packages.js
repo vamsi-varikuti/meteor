@@ -1887,18 +1887,21 @@ _.extend(Package.prototype, {
 
       // XXXX: We actually want to run the constraint solver and also edit the library to use trops
       // instead of an override.
-      _.each(names, function(name) {
-        var narr = name.split("@=");
+      names = _.map(names, function(name) {
+        var narr = name.split("@");
         return narr[0];
       });
 
       vers = _.map(vers,  function(name) {
-        var newPath =  tropohouse.packagePath(name.packageName, name.versionConstraint);
-        self.library.override(name.packageName, newPath);
+        if (name.packageName.slice(-3) === "One") {
+          var newPath =  tropohouse.packagePath(name.packageName, name.versionConstraint);
+          self.library.override(name.packageName, newPath);
+        }
         return name.packageName;
       });
 
       names = _.union(names, vers);
+
       // Create slice
       var slice = new Slice(self, {
         name: sliceName,
