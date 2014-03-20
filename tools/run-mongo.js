@@ -60,7 +60,7 @@ var findMongoPids = function (appDir, port) {
         // Matches mongos we start. Note that this matches
         // 'fake-mongod' (our mongod stub for automated tests) as well
         // as 'mongod'.
-        var m = line.match(/^\s*(\d+).+mongod .+--port (\d+) --dbpath (.+)(?:\/|\\)\.meteor(?:\/|\\)local(?:\/|\\)db(?: |$)/);
+        var m = line.match(/^\s*(\d+).+mongod .+--port (\d+) --dbpath (.+)(?:\/|\\)\.meteor(?:\/|\\)local(?:\/|\\)db/);
         if (m && m.length === 4) {
           var foundPid =  parseInt(m[1]);
           var foundPort = parseInt(m[2]);
@@ -148,8 +148,13 @@ var findMongoAndKillItDead = function (port) {
   });
 };
 
-// Starts a single instance of mongod, and configures it properly. Does not
-// yield.
+// Starts a single instance of mongod, and configures it properly as a singleton
+// replica set. Does not yield.
+//
+// If the 'multiple' option is set, it actually sets up three mongod instances
+// (launching the second and third on the next two ports after the specified
+// port). This is intended for testing mongo failover, not for normal
+// development use.
 var launchMongo = function (options) {
   var onListen = options.onListen || function () {};
   var onExit = options.onExit || function () {};
@@ -157,11 +162,15 @@ var launchMongo = function (options) {
   var noOplog = false;
   var mongod_path = path.join(
     files.getDevBundle(), 'mongodb', 'bin', 'mongod');
+  var replSetName = 'meteor';
 
   // Automated testing: If this is set, instead of starting mongod, we
   // start our stub (fake-mongod) which can then be remote-controlled
   // by the test.
   if (process.env.METEOR_TEST_FAKE_MONGOD_CONTROL_PORT) {
+    if (options.multiple)
+      throw Error("Can't specify multiple with fake mongod");
+
     mongod_path = path.join(files.getCurrentToolsDir(),
                             'tools', 'tests', 'fake-mongod', 'fake-mongod');
 
@@ -170,82 +179,82 @@ var launchMongo = function (options) {
     noOplog = true;
   }
 
-  // store data in appDir
-  var dbPath = path.join(options.appDir, '.meteor', 'local', 'db');
-  files.mkdir_p(dbPath, 0755);
   // add .gitignore if needed.
   files.addToGitignore(path.join(options.appDir, '.meteor'), 'local');
 
-  var proc = null;
-  var cancelStartup = false;
-  var callOnExit;
+  var replSetReady = false;
 
-  var handle = {
-    stop: function () {
-      if (! proc)
-        cancelStartup = true;
-      else {
-        proc.removeListener('exit', callOnExit);
-        proc.kill('SIGINT');
+  var subHandles = [];
+
+  var launchOneMongoAndWaitForReadyForInitiate = function (dbPath, port) {
+    files.mkdir_p(dbPath, 0755);
+
+    var proc = null;
+    var cancelStartup = false;
+    var callOnExit;
+
+    subHandles.push({
+      stop: function () {
+        if (! proc)
+          cancelStartup = true;
+        else {
+          proc.removeListener('exit', callOnExit);
+          proc.kill('SIGINT');
+        }
       }
-    }
-  };
+    });
 
-  Fiber(function () {
     findMongoAndKillItDead(options.port);
 
-    var portFile = path.join(dbPath, 'METEOR-PORT');
-    var portFileExists = false;
-    var createReplSet = true;
-    try {
-      createReplSet = +(fs.readFileSync(portFile)) !== options.port;
-      portFileExists = true;
-    } catch (e) {
-      if (!e || e.code !== 'ENOENT')
-        throw e;
-    }
+    var createReplSet = !noOplog;
 
-    if (noOplog)
-      createReplSet = false;
-
-    // If this is the first time we're using this DB, or we changed
-    // port since the last time, then we want to destroy any
-    // existing replSet configuration and create a new one. First we
-    // delete the "local" database if it exists. (It's a pain and slow
-    // to change the port in an existing replSet configuration. It's
-    // also a little slow to initiate a new replSet, thus the attempt
-    // to not do it unless the port changes.)
-    if (createReplSet) {
-      // Delete the port file, so we don't mistakenly believe that the DB is
-      // still configured.
-      if (portFileExists)
-        fs.unlinkSync(portFile);
-
+    if (options.multiple) {
+      // This is only for testing, so we're OK with incurring the replset
+      // setup on each startup.
+      files.rm_recursive(dbPath);
+    } else {
+      var portFileExists = false;
       try {
-        var dbFiles = fs.readdirSync(dbPath);
+        createReplSet = +(fs.readFileSync(portFile)) !== options.port;
+        portFileExists = true;
       } catch (e) {
         if (!e || e.code !== 'ENOENT')
           throw e;
       }
-      _.each(dbFiles, function (dbFile) {
-        if (/^local\./.test(dbFile))
-          fs.unlinkSync(path.join(dbPath, dbFile));
-      });
 
-      // Load mongo-livedata so we'll be able to talk to it.
-      var mongoNpmModule = unipackage.load({
-        library: release.current.library,
-        packages: [ 'mongo-livedata' ],
-        release: release.current.name
-      })['mongo-livedata'].MongoInternals.NpmModule;
+      // If this is the first time we're using this DB, or we changed port since
+      // the last time, then we want to destroy any existing replSet
+      // configuration and create a new one. First we delete the "local"
+      // database if it exists. (It's a pain and slow to change the port in an
+      // existing replSet configuration. It's also a little slow to initiate a
+      // new replSet, thus the attempt to not do it unless the port changes.)
+      //
+      // In the "multiple" case, we just wipe out the entire database and incur
+      // the cost, because this won't affect normal users running meteor.
+      if (createReplSet) {
+        // Delete the port file, so we don't mistakenly believe that the DB is
+        // still configured.
+        if (portFileExists)
+          fs.unlinkSync(portFile);
+
+        try {
+          var dbFiles = fs.readdirSync(dbPath);
+        } catch (e) {
+          if (!e || e.code !== 'ENOENT')
+            throw e;
+        }
+        _.each(dbFiles, function (dbFile) {
+          if (/^local\./.test(dbFile))
+            fs.unlinkSync(path.join(dbPath, dbFile));
+        });
+      }
     }
 
-    // Start mongod with a dummy replSet and wait for it to
-    // listen.
+    // Start mongod with a dummy replSet and wait for it to listen.
     var child_process = require('child_process');
-    var replSetName = 'meteor';
     if (cancelStartup)
       return;
+
     proc = child_process.spawn(mongod_path, [
       // nb: cli-test.sh and findMongoPids make strong assumptions about the
       // order of the arguments! Check them before changing any arguments.
@@ -266,6 +275,7 @@ var launchMongo = function (options) {
       stderrOutput += data;
     });
 
+    // XXX think about what this actually means for options.multiple
     callOnExit = function (code, signal) {
       onExit(code, signal, stderrOutput);
     };
@@ -273,53 +283,16 @@ var launchMongo = function (options) {
 
     proc.stdout.setEncoding('utf8');
     var listening = false;
-    var replSetReady = false;
     var replSetReadyToBeInitiated = false;
     var alreadyInitiatedReplSet = false;
-    var alreadyCalledOnListen = false;
-    var maybeCallOnListen = function () {
-      if (listening && (replSetReady || noOplog) && !alreadyCalledOnListen) {
-        if (createReplSet)
-          fs.writeFileSync(portFile, options.port);
-        alreadyCalledOnListen = true;
-        onListen();
-      }
-    };
 
-    var maybeInitiateReplset = function () {
-      // We need to want to create a replset, be confident that the server is
-      // listening, be confident that the server's replset implementation is
-      // ready to be initiated, and have not already done it.
-      if (!(createReplSet && listening && replSetReadyToBeInitiated
-            && !alreadyInitiatedReplSet)) {
+    var readyToTalkFuture = new Future;
+
+    var maybeReadyToTalk = function () {
+      if (readyToTalkFuture.isResolved())
         return;
-      }
-
-      alreadyInitiatedReplSet = true;
-
-      // Connect to it and start a replset.
-      var db = new mongoNpmModule.Db(
-        'meteor', new mongoNpmModule.Server('127.0.0.1', options.port),
-        {safe: true});
-      db.open(function(err, db) {
-        if (err)
-          throw err;
-        db.admin().command({
-          replSetInitiate: {
-            _id: replSetName,
-            members: [{_id : 0, host: '127.0.0.1:' + options.port}]
-          }
-        }, function (err, result) {
-          if (err)
-              throw err;
-          // why this isn't in the error is unclear.
-          if (result && result.documents && result.documents[0]
-              && result.documents[0].errmsg) {
-            throw result.document[0].errmsg;
-          }
-          db.close(true);
-        });
-      });
+      if (listening && (noOplog || replSetReadyToBeInitiated || replSetReady))
+        readyToTalkFuture.return();
     };
 
     proc.stdout.on('data', function (data) {
@@ -327,36 +300,131 @@ var launchMongo = function (options) {
       // lines
       if (/config from self or any seed \(EMPTYCONFIG\)/.test(data)) {
         replSetReadyToBeInitiated = true;
-        maybeInitiateReplset();
+        maybeReadyToTalk();
       }
 
       if (/ \[initandlisten\] waiting for connections on port/.test(data)) {
         listening = true;
-        maybeInitiateReplset();
-        maybeCallOnListen();
+        maybeReadyToTalk();
       }
 
-      if (/ \[rsMgr\] replSet PRIMARY/.test(data)) {
+      if (/ \[rsMgr\] replSet (PRIMARY|SECONDARY)/.test(data)) {
         replSetReady = true;
-        maybeCallOnListen();
+        maybeReadyToTalk();
       }
     });
-  }).run();
 
-  return handle;
+    readyToTalkFuture.wait();
+  };
+
+
+  var initiateReplSetAndWaitForReady = function () {
+    // Load mongo-livedata so we'll be able to talk to it.
+    var mongoNpmModule = unipackage.load({
+      library: release.current.library,
+      packages: [ 'mongo-livedata' ],
+      release: release.current.name
+    })['mongo-livedata'].MongoInternals.NpmModule;
+
+    var initiatedFuture = new Future;
+
+    // Connect to the intended primary and start a replset.
+    var db = new mongoNpmModule.Db(
+      'meteor', new mongoNpmModule.Server('127.0.0.1', options.port),
+      {safe: true});
+    yieldingMethod(db, 'open')();
+
+    var configuration = {
+      _id: replSetName,
+      members: [{_id: 0, host: '127.0.0.1:' + options.port, priority: 100}]
+    };
+    if (options.multiple) {
+      // Add two more members: one of which should start as secondary but could
+      // in theory become primary, and one of which can never be primary.
+      configuration.members.push({
+        _id: 1, host: '127.0.0.1:' + (options.port + 1), priority: 5
+      });
+      configuration.members.push({
+        _id: 2, host: '127.0.0.1:' + (options.port + 2), priority: 0
+      });
+    }
+
+    runLog.log("GONNA INITIATE");
+    var initiateResult = yieldingMethod(db.admin(), 'command')(
+      {replSetInitiate: configuration});
+    // why this isn't in the error is unclear.
+    if (initiateResult && initiateResult.documents
+        && initiateResult.documents[0] && initiateResult.documents[0].errmsg) {
+      throw initiateResult.documents[0].errmsg;
+    }
+
+    var status = yieldingMethod(db.admin(), 'replSetGetStatus')();
+    console.log("got status", status);
+
+    db.close(true);
+
+    initiatedFuture.wait();
+  };
+
+
+  if (options.multiple) {
+    var dbBasePath = path.join(options.appDir, '.meteor', 'local', 'dbs');
+    _.each(_.range(2), function (i) {
+      var dbPath = path.join(options.appDir, '.meteor', 'local', 'dbs', i);
+      launchOneMongoAndWaitForReadyForInitiate(dbPath, options.port + i, true);
+    });
+  } else {
+    var dbPath = path.join(options.appDir, '.meteor', 'local', 'db');
+    var portFile = path.join(dbPath, 'METEOR-PORT');
+    launchOneMongoAndWaitForReadyForInitiate(dbPath, options.port);
+  };
+
+  if (replSetReady) {
+    // If the replset is already ready (eg, we set it up the last time we ran
+    // meteor), then we're done! This is surprising in the multiple case,
+    // though, because we unconditionally blew away all the databases.
+    if (options.multiple)
+      throw Error("replset shouldn't be ready for options.multiple!");
+  } else {
+    initiateReplSetAndWaitForReady();
+  }
+
+    // // <- this is after configuration only
+    //     if (createReplSet)
+    //       fs.writeFileSync(portFile, options.port);
+
+
+  return {
+    stop: function () {
+      _.each(subHandles, function (handle) {
+        handle.stop();
+      });
+    }
+  };
 };
 
+// Like Future.wrap and _.bind in one.
+var yieldingMethod = function (object, methodName) {
+  return function () {
+    var args = _.toArray(arguments);
+    var f = new Future;
+    args.push(f.resolver());
+    object[methodName].apply(object, args);
+    return f.wait();
+  };
+};
 
 // This runs a Mongo process and restarts it whenever it fails. If it
 // restarts too often, we give up on restarting it, diagnostics are
 // logged, and onFailure is called.
 //
-// options: appDir, port, onFailure
+// options: appDir, port, onFailure, multiple
 var MongoRunner = function (options) {
   var self = this;
   self.appDir = options.appDir;
   self.port = options.port;
   self.onFailure = options.onFailure;
+  self.multiple = false && !!options.multiple;  // XXX delete true||
 
   self.handle = null;
   self.shuttingDown = false;
@@ -395,6 +463,7 @@ _.extend(MongoRunner.prototype, {
     self.handle = launchMongo({
       appDir: self.appDir,
       port: self.port,
+      multiple: self.multiple,
       onExit: _.bind(self._exited, self),
       onListen: function () {
         if (self.startupFuture) {
